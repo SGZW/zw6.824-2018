@@ -42,7 +42,11 @@ func (kvs KeyValues) Swap(i, j int) {
 }
 
 func (kvs KeyValues) Less(i, j int) bool {
-	return kvs[i].Key < kvs[j].Key
+	if kvs[i].Key != kvs[j].Key {
+		return kvs[i].Key < kvs[j].Key
+	} else {
+		return kvs[i].Value < kvs[j].Value
+	}
 }
 
 // reduceName constructs the name of the intermediate file which map task

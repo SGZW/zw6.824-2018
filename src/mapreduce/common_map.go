@@ -24,7 +24,7 @@ func doMap(
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "map read file error: %s\n", err)
 	}
-	kvs := mapF("", string(buf))
+	kvs := mapF(inFile, string(buf))
 	writeMap := make(map[string]KeyValues)
 	for _, e := range kvs {
 		k := reduceName(jobName, mapTask, ihash(e.Key)%nReduce)
