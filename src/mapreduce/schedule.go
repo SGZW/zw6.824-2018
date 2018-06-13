@@ -25,75 +25,23 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 		ntasks = nReduce
 		n_other = len(mapFiles)
 	}
-	freeWorkerChan := make(chan string, 5)
-	go func() {
-		for {
-			worker := <-registerChan
-			freeWorkerChan <- worker
-		}
-	}()
-	ttasks := ntasks
-	var mutex sync.Mutex //for taskList
-	taskList := make([]int, 0)
+	var wg sync.WaitGroup
 	for i := 0; i < ntasks; i++ {
-		taskList = append(taskList, i)
+		wg.Add(1)
+		go func(taskId int) {
+			for {
+				worker := <-registerChan
+				ok := call(worker, "Worker.DoTask", DoTaskArgs{jobName, mapFiles[taskId], phase, taskId, n_other}, nil)
+				if ok {
+					wg.Done()
+					registerChan <- worker
+					break
+				}
+			}
+		}(i)
 	}
-	for {
-		remain := 0
-		select {
-		case wk := <-freeWorkerChan:
-			index := 0
-			taskNum := 0
-			mutex.Lock()
-			remain = ntasks
-			taskNum = len(taskList)
-			if remain != 0 && taskNum == 0 {
-				go func(free chan string, wkAddr string) {
-					free <- wkAddr
-				}(freeWorkerChan, wk)
-			} else if remain != 0 {
-				index = taskList[0]
-				taskList = taskList[1:]
-			}
-			mutex.Unlock()
-			if remain == 0 || taskNum == 0 {
-				break
-			}
-			if phase == mapPhase {
-				go func(i int, free chan string, wkAddr string) {
-					status := call(wkAddr, "Worker.DoTask", DoTaskArgs{jobName, mapFiles[i], phase, i, n_other}, nil)
-					mutex.Lock()
-					if status {
-						ntasks--
-					} else {
-						taskList = append(taskList, i)
-					}
-					mutex.Unlock()
-					if status {
-						free <- wkAddr
-					}
-				}(index, freeWorkerChan, wk)
-			} else {
-				go func(i int, free chan string, wkAddr string) {
-					status := call(wkAddr, "Worker.DoTask", DoTaskArgs{jobName, "", phase, i, n_other}, nil)
-					mutex.Lock()
-					if status {
-						ntasks--
-					} else {
-						taskList = append(taskList, i)
-					}
-					mutex.Unlock()
-					if status {
-						free <- wkAddr
-					}
-				}(index, freeWorkerChan, wk)
-			}
-		}
-		if remain == 0 {
-			break
-		}
-	}
-	fmt.Printf("Schedule: %v %v tasks (%d I/Os)\n", ttasks, phase, n_other)
+	wg.Wait()
+	fmt.Printf("Schedule: %v %v tasks (%d I/Os)\n", ntasks, phase, n_other)
 
 	// All ntasks tasks have to be scheduled on workers. Once all tasks
 	// have completed successfully, schedule() should return.
