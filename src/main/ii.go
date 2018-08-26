@@ -1,7 +1,7 @@
 package main
 
 import (
-	"6.824/src/mapreduce"
+	"mapreduce"
 	"fmt"
 	"os"
 	"sort"
