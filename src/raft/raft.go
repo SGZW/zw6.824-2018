@@ -386,7 +386,10 @@ func (rf *Raft) elect() {
 	// timeout routine
 	timeoutCh := make(chan bool, 1)
 	go func() {
-		time.Sleep(time.Duration(rf.electionTimeOut) * time.Millisecond)
+		rf.Lock()
+		now_time := rf.electionTimeOut;
+		rf.Unlock()
+		time.Sleep(time.Duration(now_time) * time.Millisecond)
 		timeoutCh <- true
 	}()
 
@@ -479,6 +482,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			if (rf.state == Follower || rf.state == Candidate) && duration >= rf.electionTimeOut {
 				go rf.elect()
 			}
+			rf.electionTimeOut = 400 + rand.Intn(201)
 			rf.Unlock()
 		}
 	}()
