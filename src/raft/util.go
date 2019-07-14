@@ -1,13 +1,25 @@
 package raft
 
-import "log"
+import (
+	"fmt"
+	"log"
+)
 
 // Debugging
 const Debug = 0
 
-func DPrintf(format string, a ...interface{}) (n int, err error) {
+func DPrintf(me int , currentTerm int , state string, v ...interface{}) (n int, err error) {
 	if Debug > 0 {
-		log.Printf(format, a...)
+		log.Printf("[Server: %d Term: %d role: %s] %s", me, currentTerm, state, fmt.Sprintln(v...))
+	}
+	return
+}
+
+const ShortDebug = 0
+
+func DShortPrintf(me int, v ...interface{}) (n int, err error) {
+	if ShortDebug > 0 {
+		log.Printf("[Server: %d] %s", me, fmt.Sprintln(v...))
 	}
 	return
 }
