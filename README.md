@@ -1,10 +1,10 @@
 ### MIT6.824-2018
 this is zhangwei's MIT6.824 experiment practice
 
-## rework lab 2a:
-# 1. 事件驱动状态机
-# 2. 多线程pipeline
-# 3. 基于通信而不是基于锁的共享内存
+#### rework lab 2a:
+##### 1. 事件驱动状态机
+##### 2. 多线程pipeline
+##### 3. 基于通信而不是基于锁的共享内存
 > Test (2A): initial election ...
   ... Passed --   3.1  3   30    0
 Test (2A): election after network failure ...
