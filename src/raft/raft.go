@@ -181,7 +181,7 @@ func (r *Raft) processRequestVoteRequest(req *RequestVoteArgs, resp *RequestVote
 	} else if req.Term > r.currentTerm {
 		r.updateCurrentTerm(req.Term)
 	} else if r.votedFor != -1 && r.votedFor != req.CandidateId {
-		resp.Term =r.currentTerm
+		resp.Term = r.currentTerm
 		resp.VoteGranted = false;
 		return false;
 	}
@@ -357,6 +357,19 @@ func (r *Raft) eventLoop() {
 }
 
 func (r *Raft) leaderLoop() {
+	// first send heartbeat to followers
+	for i := 0; i < len(r.peers); i++ {
+		if i != r.me {
+			DPrintf(r.me, r.currentTerm, r.state,"heatbeat to ",  i)
+			heartbeatEvent := &event{req: &AppendEntriesArgs{
+				Term:        r.currentTerm}, index: i}
+			select {
+			case r.networkEventChan <- heartbeatEvent:
+			case <-r.stopped:
+				return
+			}
+		}
+	}
 	heartbeatTiker := time.Tick(HeartbeatInterval * time.Millisecond)
 	for r.state == Leader {
 		select {
@@ -434,6 +447,7 @@ func (r *Raft) candidateLoop() {
 			r.votedFor = r.me;
 			r.rwMutex.Unlock()
 			votesGranted = 1
+			r.votedFor = -1
 			for i := 0; i < len(r.peers); i++ {
 				if i != r.me {
 					requestVoteEvent := &event{req: &RequestVoteArgs{
