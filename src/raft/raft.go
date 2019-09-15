@@ -63,7 +63,6 @@ type event struct {
 	req interface{}
 	resp interface{}
 	errChan chan error
-	index int // peer(receiver) instance index
 }
 
 //
@@ -82,7 +81,6 @@ type Raft struct {
 	// state a Raft server must maintain.
 
 	coreEventChan chan *event // eventloop consume event from this chan
-	networkEventChan chan *event // network routine consume event from this chan
 	applyChan chan ApplyMsg // user fsm chan
 
 	// Persistent state on all servers:
@@ -179,20 +177,23 @@ func (r *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 func (r *Raft) processRequestVoteRequest(req *RequestVoteArgs, resp *RequestVoteReply) bool {
 	// Your code here (2A, 2B).
 	resp.PreVote = req.PreVote
-	if req.Term < r.currentTerm {
-		resp.Term = r.currentTerm
-		resp.VoteGranted = false;
-		return false;
-	} else if req.Term == r.currentTerm && r.votedFor != -1 && r.votedFor != req.CandidateId {
-		resp.Term = r.currentTerm
-		resp.VoteGranted = false
-		return false
-	}
-
 	if req.PreVote == false {
-		// ignore preVote
-		if req.Term > r.currentTerm {
+		if req.Term < r.currentTerm {
+			resp.Term = r.currentTerm
+			resp.VoteGranted = false
+			return false
+		} else if req.Term > r.currentTerm {
 			r.updateCurrentTerm(req.Term)
+		} else if r.votedFor != -1 && r.votedFor != req.CandidateId {
+			resp.Term = r.currentTerm
+			resp.VoteGranted = false
+			return false
+		}
+	} else {
+		if req.Term < r.currentTerm {
+			resp.Term = r.currentTerm
+			resp.VoteGranted = false
+			return false
 		}
 	}
 
@@ -229,9 +230,9 @@ func (r *Raft) updateCurrentTerm(term int) {
 		panic("updateCurrentTerm panic");
 	}
 	r.rwMutex.Lock();
-	defer r.rwMutex.Unlock();
-	r.currentTerm = term;
-	r.state = Follower;
+	defer r.rwMutex.Unlock()
+	r.currentTerm = term
+	r.state = Follower
 	DPrintf(r.me, r.currentTerm, r.state,"become follower")
 }
 
@@ -333,9 +334,6 @@ func (r *Raft) processAppendEntriesRequest(req *AppendEntriesArgs, resp *AppendE
 	}
 	// log implements
 
-	r.rwMutex.Lock()
-	defer r.rwMutex.Unlock()
-
 	// check commitIndex
 	if req.PrevLogIndex < r.commitIndex {
 		resp.Success = false
@@ -393,9 +391,6 @@ func (r *Raft) processAppendEntriesResponse(resp *AppendEntriesReply) {
 	if resp.Term > r.currentTerm {
 		r.updateCurrentTerm(resp.Term)
 	}
-
-	r.rwMutex.Lock()
-	defer r.rwMutex.Unlock()
 	if !resp.Success {
 		if resp.Inconsistency && r.nextIndex[resp.FollowerId] > 1 {
 			if resp.PrevLogIndex < r.nextIndex[resp.FollowerId] {
@@ -453,8 +448,6 @@ type CommandReply struct {
 }
 
 func (r *Raft) processCommand(req *CommandRequest, reply *CommandReply) {
-	r.rwMutex.Lock()
-	defer r.rwMutex.Unlock()
 	r.log = append(r.log, LogEntry{Command:req.Command, Term:r.currentTerm})
 	DPrintf(r.me, r.currentTerm, r.state, "add log index: " ,len(r.log), "command: ", req.Command)
 	reply.Index = len(r.log)
@@ -534,14 +527,14 @@ func (r *Raft) heartbeatToAll() {
 			}
 			//DPrintf(r.me, r.currentTerm, r.state,"heatbeat to ",  i, " entries:", len(args.Entries))
 			args.FollowerId = i
-			heartbeatEvent := &event{
-				req: args,
-				index: i}
-			select {
-			case r.networkEventChan <- heartbeatEvent:
-			case <-r.stopped:
-				return
-			}
+			go func (peerId int) {
+				resp := &AppendEntriesReply{}
+				if ok := r.sendAppendEntries(peerId, args, resp); ok {
+					r.sendAsync(resp)
+				} else {
+					DShortPrintf(r.me, "send appendEntries failed to ", peerId)
+				}
+			} (i)
 		}
 	}
 }
@@ -615,16 +608,14 @@ func (r *Raft) followerLoop() {
 func (r *Raft) candidateLoop() {
 	needNewVote := true
 	votesGranted := 0
-	r.votedFor = -1
+	r.votedFor = r.me
 	var timeoutChan <-chan time.Time
 	for r.state == Candidate {
 		if needNewVote {
 			r.rwMutex.Lock()
-			r.votedFor = r.me
 			r.currentTerm++
 			r.rwMutex.Unlock()
 			votesGranted = 1
-			r.votedFor = -1
 			for i := 0; i < len(r.peers); i++ {
 				if i != r.me {
 					args := &RequestVoteArgs{
@@ -637,13 +628,15 @@ func (r *Raft) candidateLoop() {
 						args.LastLogIndex = len(r.log)
 						args.LastLogTerm = r.log[args.LastLogIndex - 1].Term
 					}
-					requestVoteEvent := &event{req: args, index: i}
 					DPrintf(r.me, r.currentTerm, r.state, "request vote from ", i)
-					select {
-					case r.networkEventChan <- requestVoteEvent:
-					case <-r.stopped:
-						return
-					}
+					go func (peerId int) {
+						resp := &RequestVoteReply{}
+						if ok := r.sendRequestVote(peerId, args, resp); ok {
+							r.sendAsync(resp)
+						} else {
+							DShortPrintf(r.me, "send requestVote failed to ", peerId)
+						}
+					} (i)
 				}
 			}
 			timeoutChan = time.After(time.Duration(ElectionTimeOut + rand.Intn(201)) * time.Millisecond)
@@ -688,9 +681,6 @@ func (r *Raft) preCandidateLoop() {
 	var timeoutChan <-chan time.Time
 	for r.state == PreCandidate {
 		if needNewPreVote {
-			r.rwMutex.Lock()
-			r.votedFor = r.me
-			r.rwMutex.Unlock()
 			votesGranted = 1
 			for i := 0; i < len(r.peers); i++ {
 				if i != r.me {
@@ -704,13 +694,15 @@ func (r *Raft) preCandidateLoop() {
 						args.LastLogIndex = len(r.log)
 						args.LastLogTerm = r.log[args.LastLogIndex - 1].Term
 					}
-					requestVoteEvent := &event{req: args, index: i}
 					DPrintf(r.me, r.currentTerm, r.state, "request vote from ", i)
-					select {
-					case r.networkEventChan <- requestVoteEvent:
-					case <-r.stopped:
-						return
-					}
+					go func (peerId int) {
+						resp := &RequestVoteReply{}
+						if ok := r.sendRequestVote(peerId, args, resp); ok {
+							r.sendAsync(resp)
+						} else {
+							DShortPrintf(r.me, "send requestVote failed to ", peerId)
+						}
+					} (i)
 				}
 			}
 			timeoutChan = time.After(time.Duration(ElectionTimeOut + rand.Intn(201)) * time.Millisecond)
@@ -745,39 +737,6 @@ func (r *Raft) preCandidateLoop() {
 			}
 		case <- timeoutChan:
 			needNewPreVote = true
-		}
-	}
-}
-
-func (r *Raft) networkWorkerLoop() {
-	for {
-		select {
-		case <-r.stopped:
-			DShortPrintf(r.me, "network routine exit")
-			return
-		case e := <-r.networkEventChan:
-			switch req := e.req.(type) {
-			case *AppendEntriesArgs:
-				go func () {
-					resp := &AppendEntriesReply{}
-					ok := r.sendAppendEntries(e.index, req, resp)
-					if ok {
-						r.sendAsync(resp)
-					} else {
-						DShortPrintf(r.me, "send appendEnties failed to ", e.index)
-					}
-				} ()
-			case *RequestVoteArgs:
-				go func () {
-					resp := &RequestVoteReply{}
-					ok := r.sendRequestVote(e.index, req, resp)
-					if ok {
-						r.sendAsync(resp)
-					} else {
-						DShortPrintf(r.me, "send requestVote failed to ", e.index)
-					}
-				} ()
-			}
 		}
 	}
 }
@@ -849,8 +808,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// init
 	r.votedFor = -1;
 	r.currentTerm = 0
-	r.coreEventChan = make(chan *event, 256)
-	r.networkEventChan = make(chan *event, 256)
+	r.coreEventChan = make(chan *event, 1024)
 	r.applyChan = applyCh
 	r.state = Follower
 	r.stopped = make(chan bool)
@@ -860,12 +818,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	r.commitIndex = 0
 	r.lastApplied = 0
 	DPrintf(r.me, r.currentTerm, r.state,"start")
-
-	r.routineGroup.Add(1)
-	go func() {
-		defer r.routineGroup.Done()
-		r.networkWorkerLoop()
-	}()
 
 	r.routineGroup.Add(1)
 	go func() {
