@@ -6,7 +6,7 @@ import (
 )
 
 // Debugging
-const Debug = 1
+const Debug = 0
 
 func DPrintf(me int , currentTerm int , state string, v ...interface{}) (n int, err error) {
 	if Debug > 0 {
