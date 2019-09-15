@@ -18,8 +18,10 @@ package raft
 //
 
 import (
+	"fmt"
 	"labrpc"
 	"math/rand"
+	"sort"
 	"sync"
 	"time"
 )
@@ -30,9 +32,9 @@ const Leader = "Leader"
 const Stopped = "Stopped"
 const Follower = "Follower"
 const Candidate = "Candidate"
+const PreCandidate = "PreCandidate"
 const HeartbeatInterval = 180
 const ElectionTimeOut= 400
-const NetworkRoutineCount = 3
 
 
 //
@@ -81,6 +83,7 @@ type Raft struct {
 
 	coreEventChan chan *event // eventloop consume event from this chan
 	networkEventChan chan *event // network routine consume event from this chan
+	applyChan chan ApplyMsg // user fsm chan
 
 	// Persistent state on all servers:
 	currentTerm int        // latest term server has seen (initialized to 0 on first boot, increases monotonically)
@@ -150,6 +153,7 @@ type RequestVoteArgs struct {
 	CandidateId  int //candidate requesting vote, index
 	LastLogIndex int //index of candidate’s last log entry
 	LastLogTerm  int //term of candidate’s last log entry
+	PreVote bool // is preVote
 }
 
 //
@@ -160,6 +164,7 @@ type RequestVoteReply struct {
 	// Your data here (2A).
 	Term        int  //currentTerm, for candidate to update itself
 	VoteGranted bool //true means candidate received vote
+	PreVote bool // is preVote
 }
 
 //
@@ -172,24 +177,48 @@ func (r *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 
 func (r *Raft) processRequestVoteRequest(req *RequestVoteArgs, resp *RequestVoteReply) bool {
-
 	// Your code here (2A, 2B).
+	resp.PreVote = req.PreVote
 	if req.Term < r.currentTerm {
 		resp.Term = r.currentTerm
 		resp.VoteGranted = false;
 		return false;
-	} else if req.Term > r.currentTerm {
-		r.updateCurrentTerm(req.Term)
-	} else if r.votedFor != -1 && r.votedFor != req.CandidateId {
+	} else if req.Term == r.currentTerm && r.votedFor != -1 && r.votedFor != req.CandidateId {
 		resp.Term = r.currentTerm
-		resp.VoteGranted = false;
-		return false;
+		resp.VoteGranted = false
+		return false
 	}
 
-	// log implements need
+	if req.PreVote == false {
+		// ignore preVote
+		if req.Term > r.currentTerm {
+			r.updateCurrentTerm(req.Term)
+		}
+	}
+
+	// check log
+
+	if len(r.log) == 0 {
+		if req.LastLogIndex != 0 {
+			resp.Term = r.currentTerm
+			resp.VoteGranted = false
+			return false
+		}
+	} else {
+		if r.log[len(r.log) - 1].Term > req.LastLogTerm ||
+			(r.log[len(r.log) - 1].Term == req.LastLogTerm &&
+				len(r.log) > req.LastLogIndex) {
+			resp.Term = r.currentTerm
+			resp.VoteGranted = false
+			return false
+		}
+	}
 
 	DPrintf(r.me, r.currentTerm, r.state, "vote for ", req.CandidateId)
-	r.votedFor = req.CandidateId
+	if req.PreVote == false {
+		// ignore preVote
+		r.votedFor = req.CandidateId
+	}
 	resp.Term = r.currentTerm
 	resp.VoteGranted = true
 	return true
@@ -206,7 +235,13 @@ func (r *Raft) updateCurrentTerm(term int) {
 	DPrintf(r.me, r.currentTerm, r.state,"become follower")
 }
 
-func (r *Raft) processRequestVoteResponse(resp *RequestVoteReply) bool  {
+func (r *Raft) processRequestVoteResponse(resp *RequestVoteReply, preVote bool) bool  {
+	if resp.PreVote != preVote {
+		return false
+	}
+	if resp.Term < r.currentTerm {
+		return false
+	}
 	if resp.Term == r.currentTerm && resp.VoteGranted {
 		return true
 	}
@@ -214,7 +249,7 @@ func (r *Raft) processRequestVoteResponse(resp *RequestVoteReply) bool  {
 	if resp.Term > r.currentTerm {
 		r.updateCurrentTerm(resp.Term)
 	}
-	return false;
+	return false
 }
 
 //
@@ -259,11 +294,17 @@ type AppendEntriesArgs struct {
 	PrevLogTerm  int        //term of prevLogIndex entry
 	Entries      []LogEntry //log entries to store (empty for heartbeat; may send more than one for efficiency)
 	LeaderCommit int        //leader’s commitIndex
+	FollowerId int
 }
 
 type AppendEntriesReply struct {
 	Term int //currentTerm, for leader to update itself
+	PrevLogTerm int
+	PrevLogIndex int
+	EntriesCount int
+	FollowerId int
 	Success bool //true if follower contained entry matching prevLogIndex and prevLogTerm
+	Inconsistency bool // true is log not consistent
 }
 
 func (r *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -271,13 +312,17 @@ func (r *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply)
 }
 
 func (r *Raft) processAppendEntriesRequest(req *AppendEntriesArgs, resp *AppendEntriesReply) bool {
+	resp.FollowerId = req.FollowerId
+	resp.Inconsistency = false
+	resp.PrevLogIndex = req.PrevLogIndex
+	resp.PrevLogTerm = req.PrevLogTerm
 	if req.Term < r.currentTerm {
 		resp.Term = r.currentTerm
 		resp.Success = false;
 		return false
 	}
 	if req.Term == r.currentTerm {
-		if r.state == Candidate {
+		if r.state == Candidate || r.state == PreCandidate {
 			r.rwMutex.Lock()
 			r.state = Follower
 			r.rwMutex.Unlock()
@@ -287,22 +332,133 @@ func (r *Raft) processAppendEntriesRequest(req *AppendEntriesArgs, resp *AppendE
 		r.updateCurrentTerm(req.Term)
 	}
 	// log implements
+
+	r.rwMutex.Lock()
+	defer r.rwMutex.Unlock()
+
+	// check commitIndex
+	if req.PrevLogIndex < r.commitIndex {
+		resp.Success = false
+		resp.Term = r.currentTerm
+		return true
+	}
+
+	// not match
+	if req.PrevLogIndex != 0 && (len(r.log) < req.PrevLogIndex ||
+		r.log[req.PrevLogIndex - 1].Term != req.PrevLogTerm) {
+		resp.Success = false
+		resp.Term = r.currentTerm
+		resp.Inconsistency = true
+		return true
+	}
+
+	// truncate
+	if req.PrevLogIndex != 0 && len(r.log) > req.PrevLogIndex {
+		r.log = r.log[0: req.PrevLogIndex]
+	}
+
+	// append entries
+	r.log = append(r.log, req.Entries...)
+
+	if req.LeaderCommit > r.commitIndex && len(r.log) > r.commitIndex {
+		if req.LeaderCommit <= len(r.log) {
+			r.commitIndex = req.LeaderCommit
+		} else {
+			r.commitIndex = len(r.log)
+		}
+	}
+
+	for ;r.lastApplied < r.commitIndex; {
+		r.lastApplied ++
+		//DPrintf(r.me, r.currentTerm, r.state, "apply index: " ,
+		//	r.lastApplied ," command: ", r.log[r.lastApplied - 1].Command)
+		r.applyChan <- ApplyMsg{
+			CommandValid:true,
+			Command:r.log[r.lastApplied - 1].Command,
+			CommandIndex: r.lastApplied,
+		}
+	}
+
+
 	resp.Term = r.currentTerm
-	resp.Success = true;
+	resp.Success = true
+	resp.EntriesCount = len(req.Entries)
 	return true
 }
 
 func (r *Raft) processAppendEntriesResponse(resp *AppendEntriesReply) {
+	if resp.Term < r.currentTerm {
+		return
+	}
 	if resp.Term > r.currentTerm {
 		r.updateCurrentTerm(resp.Term)
 	}
+
+	r.rwMutex.Lock()
+	defer r.rwMutex.Unlock()
+	if !resp.Success {
+		if resp.Inconsistency && r.nextIndex[resp.FollowerId] > 1 {
+			if resp.PrevLogIndex < r.nextIndex[resp.FollowerId] {
+				r.nextIndex[resp.FollowerId] = resp.PrevLogIndex
+			}
+
+		}
+		return
+	}
 	// log implements
+	if r.nextIndex[resp.FollowerId] < resp.PrevLogIndex + resp.EntriesCount + 1 {
+		r.nextIndex[resp.FollowerId] = resp.PrevLogIndex + resp.EntriesCount + 1
+		r.matchIndex[resp.FollowerId] = r.nextIndex[resp.FollowerId] - 1
+	}
+
+	sortedMatchIndexArray := make([]int, len(r.peers))
+	for i, _ := range sortedMatchIndexArray {
+		if i == r.me {
+			sortedMatchIndexArray[i] = len(r.log)
+		} else {
+			sortedMatchIndexArray[i] = r.matchIndex[i]
+		}
+	}
+	sort.Ints(sortedMatchIndexArray)
+	quorumMatchIndex := sortedMatchIndexArray[len(r.peers) / 2]
+
+	if  quorumMatchIndex > r.commitIndex && r.log[quorumMatchIndex - 1].Term == r.currentTerm {
+		r.commitIndex = quorumMatchIndex
+	}
+	for ;r.lastApplied < r.commitIndex; {
+		r.lastApplied ++
+		DPrintf(r.me, r.currentTerm, r.state, "apply index: " ,
+			r.lastApplied ," command: ", r.log[r.lastApplied - 1].Command)
+		r.applyChan <- ApplyMsg{
+			CommandValid:true,
+			Command:r.log[r.lastApplied - 1].Command,
+			CommandIndex: r.lastApplied,
+		}
+	}
 }
 
 
 func (r *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := r.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
+}
+
+type CommandRequest struct {
+	Command interface{}
+}
+
+type CommandReply struct {
+	Index int
+	Term int
+}
+
+func (r *Raft) processCommand(req *CommandRequest, reply *CommandReply) {
+	r.rwMutex.Lock()
+	defer r.rwMutex.Unlock()
+	r.log = append(r.log, LogEntry{Command:req.Command, Term:r.currentTerm})
+	DPrintf(r.me, r.currentTerm, r.state, "add log index: " ,len(r.log), "command: ", req.Command)
+	reply.Index = len(r.log)
+	reply.Term = r.currentTerm
 }
 
 //
@@ -320,13 +476,13 @@ func (r *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *App
 // the leader.
 //
 func (r *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
 	// Your code here (2B).
-
-	return index, term, isLeader
+	req := &CommandRequest{Command:command}
+	reply := &CommandReply{}
+	if err := r.send(req, reply); err != nil {
+		return 0, 0, false
+	}
+	return reply.Index, reply.Term, true
 }
 
 //
@@ -351,18 +507,36 @@ func (r *Raft) eventLoop() {
 			r.followerLoop()
 		case Candidate:
 			r.candidateLoop()
+		case PreCandidate:
+			r.preCandidateLoop()
 		}
 	}
 	DShortPrintf(r.me, "eventLoop exit")
 }
 
-func (r *Raft) leaderLoop() {
-	// first send heartbeat to followers
+func (r *Raft) heartbeatToAll() {
 	for i := 0; i < len(r.peers); i++ {
 		if i != r.me {
-			DPrintf(r.me, r.currentTerm, r.state,"heatbeat to ",  i)
-			heartbeatEvent := &event{req: &AppendEntriesArgs{
-				Term:        r.currentTerm}, index: i}
+			args := &AppendEntriesArgs{}
+			args.Term = r.currentTerm
+			args.LeaderId = r.me
+			args.PrevLogIndex = r.nextIndex[i] - 1
+			if args.PrevLogIndex == 0 {
+				args.PrevLogTerm = 0
+			} else {
+				args.PrevLogTerm = r.log[args.PrevLogIndex - 1].Term
+			}
+			args.LeaderCommit = r.commitIndex
+			if len(r.log) >= r.nextIndex[i] {
+				args.Entries = r.log[r.nextIndex[i] - 1:len(r.log)]
+			} else {
+				args.Entries = make([]LogEntry, 0)
+			}
+			//DPrintf(r.me, r.currentTerm, r.state,"heatbeat to ",  i, " entries:", len(args.Entries))
+			args.FollowerId = i
+			heartbeatEvent := &event{
+				req: args,
+				index: i}
 			select {
 			case r.networkEventChan <- heartbeatEvent:
 			case <-r.stopped:
@@ -370,7 +544,15 @@ func (r *Raft) leaderLoop() {
 			}
 		}
 	}
-	heartbeatTiker := time.Tick(HeartbeatInterval * time.Millisecond)
+}
+
+func (r *Raft) leaderLoop() {
+	// reset index
+	r.resetIndex()
+	// first send heartbeat to followers
+	r.heartbeatToAll()
+
+	heartbeatTicker := time.Tick(HeartbeatInterval * time.Millisecond)
 	for r.state == Leader {
 		select {
 		case <-r.stopped:
@@ -378,6 +560,9 @@ func (r *Raft) leaderLoop() {
 			return
 		case e := <-r.coreEventChan:
 			switch req := e.req.(type) {
+			case *CommandRequest:
+				r.processCommand(req, e.resp.(*CommandReply))
+				e.errChan <- nil
 			case *AppendEntriesArgs:
 				_ = r.processAppendEntriesRequest(req, e.resp.(*AppendEntriesReply))
 				e.errChan <- nil
@@ -388,19 +573,8 @@ func (r *Raft) leaderLoop() {
 				r.processAppendEntriesResponse(req)
 			default:
 			}
-		case <-heartbeatTiker:
-			for i := 0; i < len(r.peers); i++ {
-				if i != r.me {
-					DPrintf(r.me, r.currentTerm, r.state,"heatbeat to ",  i)
-					heartbeatEvent := &event{req: &AppendEntriesArgs{
-						Term:        r.currentTerm}, index: i}
-					select {
-					case r.networkEventChan <- heartbeatEvent:
-					case <-r.stopped:
-							return
-					}
-				}
-			}
+		case <-heartbeatTicker:
+			r.heartbeatToAll()
 		}
 	}
 }
@@ -416,6 +590,8 @@ func (r *Raft) followerLoop() {
 			return
 		case e := <- r.coreEventChan:
 			switch req := e.req.(type) {
+			case *CommandRequest:
+				e.errChan <- fmt.Errorf("not leader")
 			case *AppendEntriesArgs:
 				updateTimeout = r.processAppendEntriesRequest(req, e.resp.(*AppendEntriesReply))
 				e.errChan <- nil
@@ -425,9 +601,10 @@ func (r *Raft) followerLoop() {
 			}
 		case <-timeoutChan:
 			r.rwMutex.Lock()
-			r.state = Candidate
+			r.state = PreCandidate
 			r.rwMutex.Unlock()
-			DPrintf(r.me, r.currentTerm, r.state,"become candidate because of timeout")
+			DPrintf(r.me, r.currentTerm, r.state,"become preCandidate because of timeout")
+			return
 		}
 		if updateTimeout {
 			timeoutChan = time.After(time.Duration(ElectionTimeOut + rand.Intn(201)) * time.Millisecond)
@@ -443,16 +620,24 @@ func (r *Raft) candidateLoop() {
 	for r.state == Candidate {
 		if needNewVote {
 			r.rwMutex.Lock()
-			r.currentTerm++;
-			r.votedFor = r.me;
+			r.votedFor = r.me
+			r.currentTerm++
 			r.rwMutex.Unlock()
 			votesGranted = 1
 			r.votedFor = -1
 			for i := 0; i < len(r.peers); i++ {
 				if i != r.me {
-					requestVoteEvent := &event{req: &RequestVoteArgs{
+					args := &RequestVoteArgs{
 						Term:        r.currentTerm,
-						CandidateId: r.me}, index: i}
+						CandidateId: r.me}
+					args.LastLogIndex = 0
+					args.LastLogTerm = 0
+					args.PreVote = false
+					if len(r.log) > 0 {
+						args.LastLogIndex = len(r.log)
+						args.LastLogTerm = r.log[args.LastLogIndex - 1].Term
+					}
+					requestVoteEvent := &event{req: args, index: i}
 					DPrintf(r.me, r.currentTerm, r.state, "request vote from ", i)
 					select {
 					case r.networkEventChan <- requestVoteEvent:
@@ -477,6 +662,8 @@ func (r *Raft) candidateLoop() {
 			return
 		case e := <- r.coreEventChan:
 			switch req := e.req.(type) {
+			case *CommandRequest:
+				e.errChan <- fmt.Errorf("not leader")
 			case *AppendEntriesArgs:
 				_ = r.processAppendEntriesRequest(req, e.resp.(*AppendEntriesReply))
 				e.errChan <- nil
@@ -484,13 +671,80 @@ func (r *Raft) candidateLoop() {
 				_ = r.processRequestVoteRequest(req, e.resp.(*RequestVoteReply))
 				e.errChan <- nil
 			case *RequestVoteReply:
-				voteRet := r.processRequestVoteResponse(req)
+				voteRet := r.processRequestVoteResponse(req, false)
 				if voteRet {
 					votesGranted++
 				}
 			}
 		case <- timeoutChan:
 			needNewVote = true
+		}
+	}
+}
+
+func (r *Raft) preCandidateLoop() {
+	needNewPreVote := true
+	votesGranted := 0
+	var timeoutChan <-chan time.Time
+	for r.state == PreCandidate {
+		if needNewPreVote {
+			r.rwMutex.Lock()
+			r.votedFor = r.me
+			r.rwMutex.Unlock()
+			votesGranted = 1
+			for i := 0; i < len(r.peers); i++ {
+				if i != r.me {
+					args := &RequestVoteArgs{
+						Term:        r.currentTerm + 1,
+						CandidateId: r.me}
+					args.LastLogIndex = 0
+					args.LastLogTerm = 0
+					args.PreVote = true
+					if len(r.log) > 0 {
+						args.LastLogIndex = len(r.log)
+						args.LastLogTerm = r.log[args.LastLogIndex - 1].Term
+					}
+					requestVoteEvent := &event{req: args, index: i}
+					DPrintf(r.me, r.currentTerm, r.state, "request vote from ", i)
+					select {
+					case r.networkEventChan <- requestVoteEvent:
+					case <-r.stopped:
+						return
+					}
+				}
+			}
+			timeoutChan = time.After(time.Duration(ElectionTimeOut + rand.Intn(201)) * time.Millisecond)
+			needNewPreVote = false
+		}
+		if votesGranted >= len(r.peers) / 2 + 1 {
+			r.rwMutex.Lock()
+			r.state = Candidate
+			r.rwMutex.Unlock()
+			DPrintf(r.me, r.currentTerm, r.state,"become candidate because of quorum")
+			return
+		}
+		select {
+		case <-r.stopped:
+			r.state = Stopped
+			return
+		case e := <- r.coreEventChan:
+			switch req := e.req.(type) {
+			case *CommandRequest:
+				e.errChan <- fmt.Errorf("not leader")
+			case *AppendEntriesArgs:
+				_ = r.processAppendEntriesRequest(req, e.resp.(*AppendEntriesReply))
+				e.errChan <- nil
+			case *RequestVoteArgs:
+				_ = r.processRequestVoteRequest(req, e.resp.(*RequestVoteReply))
+				e.errChan <- nil
+			case *RequestVoteReply:
+				voteRet := r.processRequestVoteResponse(req, true)
+				if voteRet {
+					votesGranted++
+				}
+			}
+		case <- timeoutChan:
+			needNewPreVote = true
 		}
 	}
 }
@@ -566,6 +820,13 @@ func (r *Raft) send(req interface{}, resp interface{}) error {
 	}
 }
 
+func (r *Raft) resetIndex() {
+	for i := 0; i < len(r.peers); i++ {
+		r.matchIndex[i] = 0
+		r.nextIndex[i] = len(r.log) + 1
+	}
+}
+
 //
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
@@ -590,21 +851,28 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	r.currentTerm = 0
 	r.coreEventChan = make(chan *event, 256)
 	r.networkEventChan = make(chan *event, 256)
+	r.applyChan = applyCh
 	r.state = Follower
 	r.stopped = make(chan bool)
+	r.log = make([]LogEntry, 0)
+	r.nextIndex = make([]int, len(r.peers))
+	r.matchIndex = make([]int, len(r.peers))
+	r.commitIndex = 0
+	r.lastApplied = 0
 	DPrintf(r.me, r.currentTerm, r.state,"start")
-	//for i := 0; i < NetworkRoutineCount; i++ {
+
 	r.routineGroup.Add(1)
 	go func() {
 		defer r.routineGroup.Done()
 		r.networkWorkerLoop()
 	}()
-	//}
+
 	r.routineGroup.Add(1)
 	go func() {
 		defer r.routineGroup.Done()
 		r.eventLoop()
 	}()
+
 	// initialize from state persisted before a crash
 	r.readPersist(persister.ReadRaftState())
 
