@@ -184,7 +184,7 @@ type RequestVoteReply struct {
 //
 func (r *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	r.send(args, reply);
+	r.send(args, reply)
 }
 
 
@@ -205,7 +205,7 @@ func (r *Raft) processRequestVoteRequest(req *RequestVoteArgs, resp *RequestVote
 			return false
 		}
 	} else {
-		if req.Term < r.currentTerm {
+		if req.Term - 1 < r.currentTerm {
 			resp.Term = r.currentTerm
 			resp.VoteGranted = false
 			return false
@@ -245,7 +245,7 @@ func (r *Raft) updateCurrentTerm(term int) {
 	if term < r.currentTerm {
 		panic("updateCurrentTerm panic")
 	}
-	r.rwMutex.Lock();
+	r.rwMutex.Lock()
 	defer r.rwMutex.Unlock()
 	r.currentTerm = term
 	r.state = Follower
@@ -312,7 +312,6 @@ type AppendEntriesArgs struct {
 	PrevLogTerm  int        //term of prevLogIndex entry
 	Entries      []LogEntry //log entries to store (empty for heartbeat; may send more than one for efficiency)
 	LeaderCommit int        //leader’s commitIndex
-	FollowerId int
 }
 
 type AppendEntriesReply struct {
@@ -320,7 +319,9 @@ type AppendEntriesReply struct {
 	PrevLogTerm int
 	PrevLogIndex int
 	EntriesCount int
-	FollowerId int
+	FromId int
+	Index int // current Index
+	CommitIndex  int // current commitIndex
 	Success bool //true if follower contained entry matching prevLogIndex and prevLogTerm
 	Inconsistency bool // true is log not consistent
 }
@@ -330,10 +331,12 @@ func (r *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply)
 }
 
 func (r *Raft) processAppendEntriesRequest(req *AppendEntriesArgs, resp *AppendEntriesReply) bool {
-	resp.FollowerId = req.FollowerId
+	resp.FromId = r.me
 	resp.Inconsistency = false
 	resp.PrevLogIndex = req.PrevLogIndex
 	resp.PrevLogTerm = req.PrevLogTerm
+	resp.Index = len(r.log)
+	resp.CommitIndex = r.commitIndex
 	if req.Term < r.currentTerm {
 		resp.Term = r.currentTerm
 		resp.Success = false
@@ -367,9 +370,26 @@ func (r *Raft) processAppendEntriesRequest(req *AppendEntriesArgs, resp *AppendE
 		return true
 	}
 
-	// truncate
-	if req.PrevLogIndex != 0 && len(r.log) > req.PrevLogIndex {
-		r.log = r.log[0: req.PrevLogIndex]
+	// truncate entries
+	if len(r.log) > req.PrevLogIndex {
+		matchCount := 0
+		for i := 0; i < len(r.log) - req.PrevLogIndex && i < len(req.Entries); i++ {
+			if req.Entries[i].Term != r.log[req.PrevLogIndex + i].Term ||
+				req.Entries[i].Command != r.log[req.PrevLogIndex + i].Command {
+				if req.PrevLogIndex + i == 0 {
+					r.log = make([]LogEntry, 0)
+				} else {
+					r.log = r.log[:req.PrevLogIndex + i]
+				}
+				break
+			}
+			matchCount += 1
+		}
+		if len(req.Entries) == matchCount {
+			req.Entries = make([]LogEntry, 0)
+		} else {
+			req.Entries = req.Entries[matchCount:]
+		}
 	}
 
 	// append entries
@@ -381,12 +401,13 @@ func (r *Raft) processAppendEntriesRequest(req *AppendEntriesArgs, resp *AppendE
 		} else {
 			r.commitIndex = len(r.log)
 		}
+		r.persist()
 	}
 
 	for ;r.lastApplied < r.commitIndex; {
 		r.lastApplied ++
-		//DPrintf(r.me, r.currentTerm, r.state, "apply index: " ,
-		//	r.lastApplied ," command: ", r.log[r.lastApplied - 1].Command)
+		DPrintf(r.me, r.currentTerm, r.state, "apply index: " ,
+			r.lastApplied ," command: ", r.log[r.lastApplied - 1].Command)
 		r.applyChan <- ApplyMsg{
 			CommandValid:true,
 			Command:r.log[r.lastApplied - 1].Command,
@@ -394,9 +415,8 @@ func (r *Raft) processAppendEntriesRequest(req *AppendEntriesArgs, resp *AppendE
 		}
 		r.persist()
 	}
-
-
-
+	resp.Index = len(r.log)
+	resp.CommitIndex = r.commitIndex
 	resp.Term = r.currentTerm
 	resp.Success = true
 	resp.EntriesCount = len(req.Entries)
@@ -409,24 +429,30 @@ func (r *Raft) processAppendEntriesResponse(resp *AppendEntriesReply) {
 	}
 	if resp.Term > r.currentTerm {
 		r.updateCurrentTerm(resp.Term)
+		return
 	}
 	if !resp.Success {
-		if resp.Inconsistency && r.nextIndex[resp.FollowerId] > 1 {
-			if resp.PrevLogIndex < r.nextIndex[resp.FollowerId] {
-				r.nextIndex[resp.FollowerId] = resp.PrevLogIndex
+		if r.nextIndex[resp.FromId] < resp.CommitIndex + 1 {
+			// preIndex < CommitIndex
+			r.nextIndex[resp.FromId] = resp.CommitIndex + 1
+			r.matchIndex[resp.FromId] = resp.CommitIndex
+		} else if resp.Inconsistency && r.nextIndex[resp.FromId] > 1 {
+			r.nextIndex[resp.FromId]--
+			if r.nextIndex[resp.FromId] > resp.Index + 1 {
+				// quickly back up
+				r.nextIndex[resp.FromId] = resp.Index + 1
 			}
-
 		}
 		return
 	}
 	// log implements
-	if r.nextIndex[resp.FollowerId] < resp.PrevLogIndex + resp.EntriesCount + 1 {
-		r.nextIndex[resp.FollowerId] = resp.PrevLogIndex + resp.EntriesCount + 1
-		r.matchIndex[resp.FollowerId] = r.nextIndex[resp.FollowerId] - 1
+	if r.nextIndex[resp.FromId] < resp.PrevLogIndex + resp.EntriesCount + 1 {
+		r.nextIndex[resp.FromId] = resp.PrevLogIndex + resp.EntriesCount + 1
+		r.matchIndex[resp.FromId] = r.nextIndex[resp.FromId] - 1
 	}
 
 	sortedMatchIndexArray := make([]int, len(r.peers))
-	for i, _ := range sortedMatchIndexArray {
+	for i := range sortedMatchIndexArray {
 		if i == r.me {
 			sortedMatchIndexArray[i] = len(r.log)
 		} else {
@@ -438,6 +464,7 @@ func (r *Raft) processAppendEntriesResponse(resp *AppendEntriesReply) {
 
 	if  quorumMatchIndex > r.commitIndex && r.log[quorumMatchIndex - 1].Term == r.currentTerm {
 		r.commitIndex = quorumMatchIndex
+		r.persist()
 	}
 	for ;r.lastApplied < r.commitIndex; {
 		r.lastApplied ++
@@ -448,8 +475,8 @@ func (r *Raft) processAppendEntriesResponse(resp *AppendEntriesReply) {
 			Command:r.log[r.lastApplied - 1].Command,
 			CommandIndex: r.lastApplied,
 		}
+		r.persist()
 	}
-	r.persist()
 }
 
 
@@ -546,8 +573,7 @@ func (r *Raft) heartbeatToAll() {
 			} else {
 				args.Entries = make([]LogEntry, 0)
 			}
-			//DPrintf(r.me, r.currentTerm, r.state,"heatbeat to ",  i, " entries:", len(args.Entries))
-			args.FollowerId = i
+			//DPrintf(r.me, r.currentTerm, r.state,"heartbeat to ",  i, " entries:", len(args.Entries))
 			go func (peerId int) {
 				resp := &AppendEntriesReply{}
 				if ok := r.sendAppendEntries(peerId, args, resp); ok {
@@ -810,7 +836,7 @@ func (r *Raft) resetIndex() {
 }
 
 func (r *Raft) init() {
-	r.votedFor = -1;
+	r.votedFor = -1
 	r.currentTerm = 0
 	r.log = make([]LogEntry, 0)
 	r.commitIndex = 0
