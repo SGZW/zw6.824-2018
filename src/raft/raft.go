@@ -110,49 +110,48 @@ func (r *Raft) GetState() (int, bool) {
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
 //
-func (rf *Raft) persist() {
-	// Your code here (2C).
-	// Example:
+func (r *Raft) persist() {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
-	e.Encode(rf.currentTerm)
-	e.Encode(rf.votedFor)
-	e.Encode(rf.log)
-	e.Encode(rf.commitIndex)
-	e.Encode(rf.lastApplied)
+	e.Encode(r.currentTerm)
+	e.Encode(r.votedFor)
+	e.Encode(r.log)
+	e.Encode(r.commitIndex)
+	e.Encode(r.lastApplied)
 	data := w.Bytes()
-	rf.persister.SaveRaftState(data)
+	r.persister.SaveRaftState(data)
 }
 
 //
 // restore previously persisted state.
 //
-func (rf *Raft) readPersist(data []byte) {
+func (r *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
-		defer rf.init()
+		r.init()
 		return
 	}
-	// Your code here (2C).
-	// Example:
-	r := bytes.NewBuffer(data)
-	d := labgob.NewDecoder(r)
-	if d.Decode(&rf.currentTerm) != nil {
-		defer rf.init()
+	re := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(re)
+	if d.Decode(&r.currentTerm) != nil {
+		r.init()
 		return
 	}
-	d.Decode(&rf.votedFor)
-	d.Decode(&rf.log)
-	d.Decode(&rf.commitIndex)
-	d.Decode(&rf.lastApplied)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	if d.Decode(&r.votedFor) != nil {
+		r.init()
+		return
+	}
+	if d.Decode(&r.log) != nil {
+		r.init()
+		return
+	}
+	if d.Decode(&r.commitIndex) != nil {
+		r.init()
+		return
+	}
+	if d.Decode(&r.lastApplied) != nil {
+		r.init()
+		return
+	}
 }
 
 //
