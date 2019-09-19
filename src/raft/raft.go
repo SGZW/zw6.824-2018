@@ -18,7 +18,9 @@ package raft
 //
 
 import (
+	"bytes"
 	"fmt"
+	"labgob"
 	"labrpc"
 	"math/rand"
 	"sort"
@@ -111,12 +113,15 @@ func (r *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	e.Encode(rf.commitIndex)
+	e.Encode(rf.lastApplied)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -124,12 +129,21 @@ func (rf *Raft) persist() {
 //
 func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
+		defer rf.init()
 		return
 	}
 	// Your code here (2C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	if d.Decode(&rf.currentTerm) != nil {
+		defer rf.init()
+		return
+	}
+	d.Decode(&rf.votedFor)
+	d.Decode(&rf.log)
+	d.Decode(&rf.commitIndex)
+	d.Decode(&rf.lastApplied)
 	// var xxx
 	// var yyy
 	// if d.Decode(&xxx) != nil ||
@@ -163,6 +177,7 @@ type RequestVoteReply struct {
 	Term        int  //currentTerm, for candidate to update itself
 	VoteGranted bool //true means candidate received vote
 	PreVote bool // is preVote
+	FromId int
 }
 
 //
@@ -177,6 +192,7 @@ func (r *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 func (r *Raft) processRequestVoteRequest(req *RequestVoteArgs, resp *RequestVoteReply) bool {
 	// Your code here (2A, 2B).
 	resp.PreVote = req.PreVote
+	resp.FromId = r.me
 	if req.PreVote == false {
 		if req.Term < r.currentTerm {
 			resp.Term = r.currentTerm
@@ -219,6 +235,7 @@ func (r *Raft) processRequestVoteRequest(req *RequestVoteArgs, resp *RequestVote
 	if req.PreVote == false {
 		// ignore preVote
 		r.votedFor = req.CandidateId
+		r.persist()
 	}
 	resp.Term = r.currentTerm
 	resp.VoteGranted = true
@@ -227,12 +244,13 @@ func (r *Raft) processRequestVoteRequest(req *RequestVoteArgs, resp *RequestVote
 
 func (r *Raft) updateCurrentTerm(term int) {
 	if term < r.currentTerm {
-		panic("updateCurrentTerm panic");
+		panic("updateCurrentTerm panic")
 	}
 	r.rwMutex.Lock();
 	defer r.rwMutex.Unlock()
 	r.currentTerm = term
 	r.state = Follower
+	r.persist()
 	DPrintf(r.me, r.currentTerm, r.state,"become follower")
 }
 
@@ -319,11 +337,11 @@ func (r *Raft) processAppendEntriesRequest(req *AppendEntriesArgs, resp *AppendE
 	resp.PrevLogTerm = req.PrevLogTerm
 	if req.Term < r.currentTerm {
 		resp.Term = r.currentTerm
-		resp.Success = false;
+		resp.Success = false
 		return false
 	}
 	if req.Term == r.currentTerm {
-		if r.state == Candidate || r.state == PreCandidate {
+		if r.state == Candidate {
 			r.rwMutex.Lock()
 			r.state = Follower
 			r.rwMutex.Unlock()
@@ -375,7 +393,9 @@ func (r *Raft) processAppendEntriesRequest(req *AppendEntriesArgs, resp *AppendE
 			Command:r.log[r.lastApplied - 1].Command,
 			CommandIndex: r.lastApplied,
 		}
+		r.persist()
 	}
+
 
 
 	resp.Term = r.currentTerm
@@ -430,6 +450,7 @@ func (r *Raft) processAppendEntriesResponse(resp *AppendEntriesReply) {
 			CommandIndex: r.lastApplied,
 		}
 	}
+	r.persist()
 }
 
 
@@ -452,6 +473,7 @@ func (r *Raft) processCommand(req *CommandRequest, reply *CommandReply) {
 	DPrintf(r.me, r.currentTerm, r.state, "add log index: " ,len(r.log), "command: ", req.Command)
 	reply.Index = len(r.log)
 	reply.Term = r.currentTerm
+	r.persist()
 }
 
 //
@@ -607,15 +629,16 @@ func (r *Raft) followerLoop() {
 
 func (r *Raft) candidateLoop() {
 	needNewVote := true
-	votesGranted := 0
+	voteSet := make(map[int]bool, 0)
 	r.votedFor = r.me
 	var timeoutChan <-chan time.Time
 	for r.state == Candidate {
 		if needNewVote {
 			r.rwMutex.Lock()
 			r.currentTerm++
+			r.persist()
 			r.rwMutex.Unlock()
-			votesGranted = 1
+			voteSet = make(map[int]bool, 0)
 			for i := 0; i < len(r.peers); i++ {
 				if i != r.me {
 					args := &RequestVoteArgs{
@@ -642,7 +665,7 @@ func (r *Raft) candidateLoop() {
 			timeoutChan = time.After(time.Duration(ElectionTimeOut + rand.Intn(201)) * time.Millisecond)
 			needNewVote = false
 		}
-		if votesGranted >= len(r.peers) / 2 + 1 {
+		if len(voteSet) + 1  >= len(r.peers) / 2 + 1 {
 			r.rwMutex.Lock()
 			r.state = Leader
 			r.rwMutex.Unlock()
@@ -665,8 +688,8 @@ func (r *Raft) candidateLoop() {
 				e.errChan <- nil
 			case *RequestVoteReply:
 				voteRet := r.processRequestVoteResponse(req, false)
-				if voteRet {
-					votesGranted++
+				if _, ok := voteSet[req.FromId]; voteRet && !ok {
+					voteSet[req.FromId] = true
 				}
 			}
 		case <- timeoutChan:
@@ -677,11 +700,11 @@ func (r *Raft) candidateLoop() {
 
 func (r *Raft) preCandidateLoop() {
 	needNewPreVote := true
-	votesGranted := 0
+	voteSet := make(map[int]bool, 0)
 	var timeoutChan <-chan time.Time
 	for r.state == PreCandidate {
 		if needNewPreVote {
-			votesGranted = 1
+			voteSet = make(map[int]bool, 0)
 			for i := 0; i < len(r.peers); i++ {
 				if i != r.me {
 					args := &RequestVoteArgs{
@@ -708,11 +731,11 @@ func (r *Raft) preCandidateLoop() {
 			timeoutChan = time.After(time.Duration(ElectionTimeOut + rand.Intn(201)) * time.Millisecond)
 			needNewPreVote = false
 		}
-		if votesGranted >= len(r.peers) / 2 + 1 {
+		if len(voteSet) + 1 >= len(r.peers) / 2 + 1 {
 			r.rwMutex.Lock()
 			r.state = Candidate
 			r.rwMutex.Unlock()
-			DPrintf(r.me, r.currentTerm, r.state,"become candidate because of quorum")
+			DPrintf(r.me, r.currentTerm, r.state,"become candidate because of quorum", len(voteSet) + 1, len(r.peers) / 2 + 1)
 			return
 		}
 		select {
@@ -731,8 +754,9 @@ func (r *Raft) preCandidateLoop() {
 				e.errChan <- nil
 			case *RequestVoteReply:
 				voteRet := r.processRequestVoteResponse(req, true)
-				if voteRet {
-					votesGranted++
+				DPrintf(r.me, r.currentTerm, r.state, "request pre vote success from", req.FromId)
+				if _, ok := voteSet[req.FromId]; voteRet && !ok {
+					voteSet[req.FromId] = true
 				}
 			}
 		case <- timeoutChan:
@@ -786,6 +810,13 @@ func (r *Raft) resetIndex() {
 	}
 }
 
+func (r *Raft) init() {
+	r.votedFor = -1;
+	r.currentTerm = 0
+	r.log = make([]LogEntry, 0)
+	r.commitIndex = 0
+	r.lastApplied = 0
+}
 //
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
@@ -806,18 +837,17 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (2A, 2B, 2C).
 	// init
-	r.votedFor = -1;
-	r.currentTerm = 0
 	r.coreEventChan = make(chan *event, 1024)
 	r.applyChan = applyCh
 	r.state = Follower
 	r.stopped = make(chan bool)
-	r.log = make([]LogEntry, 0)
 	r.nextIndex = make([]int, len(r.peers))
 	r.matchIndex = make([]int, len(r.peers))
-	r.commitIndex = 0
-	r.lastApplied = 0
-	DPrintf(r.me, r.currentTerm, r.state,"start")
+	r.readPersist(persister.ReadRaftState())
+	s := fmt.Sprintf("start with voted for: %v, commitIndex: %v, lastApply: %v log len: %v", r.votedFor, r.commitIndex, r.lastApplied, len(r.log))
+	DPrintf(r.me, r.currentTerm, r.state, s)
+
+	// initialize from state persisted before a crash
 
 	r.routineGroup.Add(1)
 	go func() {
@@ -825,8 +855,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		r.eventLoop()
 	}()
 
-	// initialize from state persisted before a crash
-	r.readPersist(persister.ReadRaftState())
 
 	return r
 }
