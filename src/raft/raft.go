@@ -337,6 +337,7 @@ func (r *Raft) processAppendEntriesRequest(req *AppendEntriesArgs, resp *AppendE
 	resp.PrevLogTerm = req.PrevLogTerm
 	resp.Index = len(r.log)
 	resp.CommitIndex = r.commitIndex
+	resp.EntriesCount = len(req.Entries)
 	if req.Term < r.currentTerm {
 		resp.Term = r.currentTerm
 		resp.Success = false
@@ -419,7 +420,6 @@ func (r *Raft) processAppendEntriesRequest(req *AppendEntriesArgs, resp *AppendE
 	resp.CommitIndex = r.commitIndex
 	resp.Term = r.currentTerm
 	resp.Success = true
-	resp.EntriesCount = len(req.Entries)
 	return true
 }
 
@@ -437,11 +437,18 @@ func (r *Raft) processAppendEntriesResponse(resp *AppendEntriesReply) {
 			r.nextIndex[resp.FromId] = resp.CommitIndex + 1
 			r.matchIndex[resp.FromId] = resp.CommitIndex
 		} else if resp.Inconsistency && r.nextIndex[resp.FromId] > 1 {
-			r.nextIndex[resp.FromId]--
+			if resp.PrevLogIndex < r.nextIndex[resp.FromId] {
+				r.nextIndex[resp.FromId] = resp.PrevLogIndex
+			}
 			if r.nextIndex[resp.FromId] > resp.Index + 1 {
 				// quickly back up
 				r.nextIndex[resp.FromId] = resp.Index + 1
 			}
+			if r.nextIndex[resp.FromId] < r.matchIndex[resp.FromId] + 1 {
+				// keep 幂等
+				r.nextIndex[resp.FromId] = r.matchIndex[resp.FromId] + 1
+			}
+			DPrintf(r.me, r.currentTerm, r.state, "fromId:", resp.FromId, "nextIndex", r.nextIndex[resp.FromId])
 		}
 		return
 	}
@@ -459,7 +466,7 @@ func (r *Raft) processAppendEntriesResponse(resp *AppendEntriesReply) {
 			sortedMatchIndexArray[i] = r.matchIndex[i]
 		}
 	}
-	sort.Ints(sortedMatchIndexArray)
+	sort.Sort(sort.Reverse(sort.IntSlice(sortedMatchIndexArray)))
 	quorumMatchIndex := sortedMatchIndexArray[len(r.peers) / 2]
 
 	if  quorumMatchIndex > r.commitIndex && r.log[quorumMatchIndex - 1].Term == r.currentTerm {
