@@ -16,35 +16,37 @@ this is zhangwei's MIT6.824 experiment practice
 * Test (2B): basic agreement ...
 *  ... Passed --   1.5  5   36    3
 * Test (2B): agreement despite follower disconnection ...
-*  ... Passed --   5.2  3   74    7
+*  ... Passed --   5.1  3   68    7
 * Test (2B): no agreement if too many followers disconnect ...
-*  ... Passed --   4.0  5  156    4
+*  ... Passed --   4.0  5  140    4
 * Test (2B): concurrent Start()s ...
-*  ... Passed --   0.8  3   10    6
+*  ... Passed --   1.2  3   12    6
 * Test (2B): rejoin of partitioned leader ...
-*  ... Passed --   7.3  3  128    4
+*  ... Passed --   5.2  3  104    4
 * Test (2B): leader backs up quickly over incorrect follower logs ...
-*  ... Passed --  49.2  5 2544  105
+*  ... Passed --  41.2  5 2120  102
 * Test (2B): RPC counts aren't too high ...
-*   ... Passed --   2.8  3   30   12
+*  ... Passed --   3.1  3   34   12
 * PASS
-* ok      raft    70.933s
+* ok      raft    61.395s
+
 
 * Test (2C): basic persistence ...
-*   ... Passed --   5.5  3   76    6
+*  ... Passed --   5.3  3   76    6
 * Test (2C): more persistence ...
-*   ... Passed --  20.0  5  732   16
+*  ... Passed --  19.8  5  728   16
 * Test (2C): partitioned leader and one follower crash, leader restarts ...
-*   ... Passed --   2.8  3   34    4
+*  ... Passed --   2.8  3   34    4
 * Test (2C): Figure 8 ...
-*   ... Passed --  37.9  5  936   16
+*  ... Passed --  28.3  5  708   12
 * Test (2C): unreliable agreement ...
-*   ... Passed --  13.6  5  336  246
+*  ... Passed --   9.9  5  224  246
 * Test (2C): Figure 8 (unreliable) ...
-*   ... Passed --  35.0  5 2220  911
+*  ... Passed --  36.3  5 2232  661
 * Test (2C): churn ...
-*  ... Passed --  16.3  5  428  181
+*  ... Passed --  16.4  5  380  211
 * Test (2C): unreliable churn ...
-*  ... Passed --  16.4  5  500  122
+*  ... Passed --  16.3  5  404  204
 * PASS
-* ok      raft    147.469s
+* ok      raft    135.107s
+
