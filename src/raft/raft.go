@@ -96,7 +96,6 @@ type Raft struct {
 	//Volatile state on leaders: (Reinitialized after election)
 	nextIndex  []int //for each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
 	matchIndex []int //for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
-	incrementRequestId[]int64 // for each server, incrementId for ae rpc
 }
 
 // return currentTerm and whether this server
@@ -313,7 +312,6 @@ type AppendEntriesArgs struct {
 	PrevLogTerm  int        //term of prevLogIndex entry
 	Entries      []LogEntry //log entries to store (empty for heartbeat; may send more than one for efficiency)
 	LeaderCommit int        //leader’s commitIndex
-	RequestId    int64
 }
 
 type AppendEntriesReply struct {
@@ -327,7 +325,6 @@ type AppendEntriesReply struct {
 	Success bool //true if follower contained entry matching prevLogIndex and prevLogTerm
 	Inconsistency bool // true is log not consistent
 	BackUpNextIndex int // quickly backup
-	RequestId    int64
 }
 
 func (r *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -342,7 +339,6 @@ func (r *Raft) processAppendEntriesRequest(req *AppendEntriesArgs, resp *AppendE
 	resp.Index = len(r.log)
 	resp.CommitIndex = r.commitIndex
 	resp.EntriesCount = len(req.Entries)
-	resp.RequestId = req.RequestId
 	if req.Term < r.currentTerm {
 		resp.Term = r.currentTerm
 		resp.Success = false
@@ -440,10 +436,6 @@ func (r *Raft) processAppendEntriesRequest(req *AppendEntriesArgs, resp *AppendE
 }
 
 func (r *Raft) processAppendEntriesResponse(resp *AppendEntriesReply) {
-	if resp.RequestId < r.incrementRequestId[resp.FromId] {
-		// reject timeout resp
-		return
-	}
 	if resp.Term < r.currentTerm {
 		return
 	}
@@ -596,8 +588,6 @@ func (r *Raft) heartbeatToAll() {
 			} else {
 				args.Entries = make([]LogEntry, 0)
 			}
-			r.incrementRequestId[i]++
-			args.RequestId = r.incrementRequestId[i]
 			//DPrintf(r.me, r.currentTerm, r.state,"heartbeat to ",  i, " entries:", len(args.Entries))
 			go func (peerId int) {
 				resp := &AppendEntriesReply{}
@@ -857,7 +847,6 @@ func (r *Raft) resetIndex() {
 	for i := 0; i < len(r.peers); i++ {
 		r.matchIndex[i] = 0
 		r.nextIndex[i] = len(r.log) + 1
-		r.incrementRequestId[i] = int64(r.currentTerm) << 30
 	}
 }
 
@@ -894,7 +883,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	r.stopped = make(chan bool)
 	r.nextIndex = make([]int, len(r.peers))
 	r.matchIndex = make([]int, len(r.peers))
-	r.incrementRequestId = make([]int64, len(r.peers))
 	r.readPersist(persister.ReadRaftState())
 	s := fmt.Sprintf("start with voted for: %v, commitIndex: %v, lastApply: %v log len: %v", r.votedFor, r.commitIndex, r.lastApplied, len(r.log))
 	DPrintf(r.me, r.currentTerm, r.state, s)
